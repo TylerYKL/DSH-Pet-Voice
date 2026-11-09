@@ -18,6 +18,3 @@ build/
 .idea/
 *.swp
 *.swo
-
-# DSH plugin specifics
-cordis.patch.yml
