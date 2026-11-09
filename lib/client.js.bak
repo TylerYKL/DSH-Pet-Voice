@@ -1,0 +1,386 @@
+window.__ModuleLoader__.load({ id: "dsh-plugin-voice-pet", factory: (require) => {
+
+	var module = { exports: {} };
+	var exports = module.exports;
+	Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
+
+	// DSH Voice Pet Plugin - Client half
+	// Served via /plugins combos and loaded as a ModuleLoader factory.
+	// Self-contained (no external requires): polls the host's /api/voice-pet
+	// routes, speaks projected scenarios through pre-generated audio files
+	// (Web Speech fallback), and renders the floating pet.
+	// Client plugin contract: exports { name, inject, apply }.
+
+	const POLL_MS = 1000;
+	const DEBOUNCE_MS = 30000;
+	const PLUGIN_ID = "dsh-plugin-voice-pet";
+
+	const FILE_MAP = {
+		cute: { complete: "cute_complete.mp3", error: "cute_error.mp3", idle: "cute_idle.mp3" },
+		mech: { complete: "mech_complete.mp3", error: "mech_error.mp3", idle: "mech_idle.mp3" },
+		tech: {
+			complete: "tech_task_done.mp3",
+			complete_2: "tech_task_done_2.mp3",
+			error: "tech_error.mp3",
+			error_2: "tech_error_2.mp3",
+			idle: "tech_idle.mp3",
+			idle_2: "tech_idle_2.mp3",
+			startup: "tech_startup.mp3",
+			startup_2: "tech_startup_2.mp3",
+			session_end: "tech_session_end.mp3",
+			session_end_2: "tech_session_end_2.mp3"
+		}
+	};
+
+	const SCENARIO_FILE_KEY = {
+		task_done: "complete",
+		task_done_2: "complete_2",
+		error: "error",
+		error_2: "error_2",
+		session_end: "session_end",
+		session_end_2: "session_end_2"
+	};
+
+	function speakText(scenario) {
+		const map = {
+			task_done: "任务已完成。请确认结果。",
+			task_done_2: "执行结束。所有指令已处理完毕。",
+			error: "检测到异常。请立即检查日志。",
+			error_2: "警告。操作未成功，请重试。",
+			session_end: "会话已结束。感谢使用。",
+			session_end_2: "连接断开。随时欢迎您回来。"
+		};
+		return map[scenario] ?? "";
+	}
+
+	// ---------- preferences ----------
+
+	function loadPrefs() {
+		try {
+			return JSON.parse(localStorage.getItem(PLUGIN_ID + ":prefs") || "{}");
+		} catch {
+			return {};
+		}
+	}
+
+	function savePrefs(prefs) {
+		try {
+			localStorage.setItem(PLUGIN_ID + ":prefs", JSON.stringify(prefs));
+		} catch {}
+	}
+
+	// ---------- voice engine ----------
+
+	function createVoiceEngine(prefs) {
+		let audio = null;
+		const available = new Map(); // file -> bool
+
+		async function probe(file) {
+			try {
+				const res = await fetch(`/api/voice-pet/voices/${file}`, {
+					method: "HEAD",
+					signal: AbortSignal.timeout(4000)
+				});
+				available.set(file, res.ok);
+			} catch {
+				available.set(file, false);
+			}
+		}
+
+		async function init() {
+			const all = new Set();
+			for (const scenarios of Object.values(FILE_MAP)) {
+				for (const file of Object.values(scenarios)) all.add(file);
+			}
+			await Promise.all([...all].map(probe));
+		}
+
+		function playFile(file, volume) {
+			return new Promise((resolve, reject) => {
+				if (audio) {
+					audio.pause();
+					audio.src = "";
+				}
+				const a = new Audio(`/api/voice-pet/voices/${file}`);
+				audio = a;
+				a.volume = volume;
+				a.onended = () => {
+					audio = null;
+					resolve();
+				};
+				a.onerror = () => {
+					audio = null;
+					reject(new Error("audio-error"));
+				};
+				a.play().catch(reject);
+			});
+		}
+
+		function speakWebSpeech(text) {
+			if (!("speechSynthesis" in window)) return Promise.resolve();
+			const presets = {
+				cute: { rate: 1.25, pitch: 1.5 },
+				mech: { rate: 0.9, pitch: 0.8 },
+				tech: { rate: 1.05, pitch: 1.05 }
+			};
+			const p = presets[prefs.style] ?? presets.tech;
+			return new Promise((resolve) => {
+				const u = new SpeechSynthesisUtterance(text);
+				u.lang = "zh-CN";
+				u.rate = p.rate;
+				u.pitch = p.pitch;
+				u.volume = prefs.volume;
+				const voices = speechSynthesis.getVoices();
+				const zh = voices.find((v) => v.lang.startsWith("zh")) ?? voices.find((v) => v.lang.includes("CN"));
+				if (zh) u.voice = zh;
+				u.onend = () => resolve();
+				u.onerror = () => resolve();
+				speechSynthesis.cancel();
+				speechSynthesis.speak(u);
+			});
+		}
+
+		async function speakScenario(scenario, volume) {
+			const variants = [scenario, scenario + "_2"];
+			const pickable = variants.filter((v) => {
+				const file = FILE_MAP[prefs.style]?.[SCENARIO_FILE_KEY[v]];
+				return file && available.get(file);
+			});
+			const chosen = pickable.length > 0 ? pickable[Math.floor(Math.random() * pickable.length)] : null;
+			if (chosen) {
+				try {
+					return await playFile(FILE_MAP[prefs.style][SCENARIO_FILE_KEY[chosen]], volume);
+				} catch {
+					// fall through to Web Speech
+				}
+			}
+			return speakWebSpeech(speakText(chosen ?? scenario));
+		}
+
+		async function speakStartup(volume) {
+			const scenario = Math.random() < 0.5 ? "startup" : "startup_2";
+			const file = FILE_MAP[prefs.style]?.[scenario];
+			if (file && available.get(file)) {
+				try {
+					return await playFile(file, volume);
+				} catch {} // fall through to Web Speech
+			}
+			const map = {
+				startup: "早安，欢迎回来。系统已就绪。",
+				startup_2: "系统启动完成。主人，今日有何吩咐？"
+			};
+			return speakWebSpeech(map[scenario]);
+		}
+
+		function stop() {
+			if (audio) {
+				audio.pause();
+				audio.src = "";
+				audio = null;
+			}
+			if ("speechSynthesis" in window) {
+				try {
+					speechSynthesis.cancel();
+				} catch {}
+			}
+		}
+
+		return { init, speakScenario, speakStartup, stop };
+	}
+
+	// ---------- pet UI ----------
+
+	function createPetUI(getPrefs, onStyleCycle) {
+		const el = document.createElement("div");
+		el.id = "voice-pet";
+		el.style.cssText = "position:fixed;right:24px;bottom:130px;width:64px;height:64px;cursor:grab;z-index:9999;user-select:none;";
+		el.innerHTML = `
+			<div class="vp-body" style="width:64px;height:64px;border-radius:50%;
+				background:radial-gradient(circle at 35% 30%,#eeff8f,#b7e549 55%,#4f8a1e);
+				box-shadow:0 6px 20px rgba(0,0,0,.45);position:relative;">
+				<div style="position:absolute;top:18px;left:11px;width:42px;height:26px;">
+					<div class="vp-eye" style="position:absolute;top:3px;left:5px;width:8px;height:10px;background:#1e293b;border-radius:50%;"></div>
+					<div class="vp-eye" style="position:absolute;top:3px;right:5px;width:8px;height:10px;background:#1e293b;border-radius:50%;"></div>
+					<div class="vp-mouth" style="position:absolute;bottom:3px;left:50%;transform:translateX(-50%);width:13px;height:4px;background:#1e293b;border-radius:0 0 7px 7px;transition:all .15s;"></div>
+				</div>
+			</div>
+			<div class="vp-bubble" style="position:absolute;bottom:70px;right:0;background:#fff;color:#0f172a;
+				padding:6px 10px;border-radius:10px;font-size:12px;max-width:160px;white-space:nowrap;
+				box-shadow:0 4px 12px rgba(0,0,0,.3);opacity:0;transform:translateY(6px);
+				transition:opacity .2s,transform .2s;pointer-events:none;"></div>`;
+		document.body.appendChild(el);
+
+		if (!document.getElementById("voice-pet-kf")) {
+			const style = document.createElement("style");
+			style.id = "voice-pet-kf";
+			style.textContent = `
+				@keyframes vp-breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.05)}}`;
+			document.head.appendChild(style);
+		}
+		const body = el.querySelector(".vp-body");
+		body.style.animation = "vp-breathe 3s ease-in-out infinite";
+
+		function setState(state) {
+			const mouth = el.querySelector(".vp-mouth");
+			if (state === "speaking") {
+				body.style.animation = "vp-breathe .25s ease-in-out infinite alternate";
+				mouth.style.height = "9px";
+				mouth.style.width = "8px";
+				mouth.style.borderRadius = "50%";
+			} else {
+				body.style.animation = "vp-breathe 3s ease-in-out infinite";
+				mouth.style.height = "";
+				mouth.style.width = "";
+				mouth.style.borderRadius = "";
+			}
+		}
+
+		let bubbleTimer = 0;
+		function showBubble(text) {
+			const b = el.querySelector(".vp-bubble");
+			b.textContent = text;
+			b.style.opacity = "1";
+			b.style.transform = "translateY(0)";
+			clearTimeout(bubbleTimer);
+			bubbleTimer = setTimeout(() => {
+				b.style.opacity = "0";
+				b.style.transform = "translateY(6px)";
+			}, 3000);
+		}
+
+		function refreshTitle() {
+			const names = { cute: "语音宠物（可爱·双击换风格）", mech: "语音宠物（机械·双击换风格）", tech: "语音宠物（科技·双击换风格）" };
+			el.title = names[getPrefs().style] ?? "语音宠物";
+		}
+		refreshTitle();
+		el.addEventListener("dblclick", () => {
+			onStyleCycle();
+			refreshTitle();
+		});
+
+		// draggable; a plain click without movement does nothing (dblclick cycles style)
+		let dragging = false;
+		let moved = false;
+		let ox = 0;
+		let oy = 0;
+		el.addEventListener("mousedown", (e) => {
+			dragging = true;
+			moved = false;
+			const r = el.getBoundingClientRect();
+			ox = e.clientX - r.left;
+			oy = e.clientY - r.top;
+		});
+		window.addEventListener("mousemove", (e) => {
+			if (!dragging) return;
+			moved = true;
+			el.style.right = "auto";
+			el.style.bottom = "auto";
+			el.style.left = `${e.clientX - ox}px`;
+			el.style.top = `${e.clientY - oy}px`;
+		});
+		window.addEventListener("mouseup", () => {
+			dragging = false;
+		});
+
+		return { el, setState, showBubble };
+	}
+
+	// ---------- main ----------
+
+	let disposed = false;
+	let cursor = 0;
+	let lastSpeakTime = 0;
+
+	function isDoNotDisturb() {
+		const h = new Date().getHours();
+		return h >= 22 || h < 7; // 22:00-07:00 静默任务完成播报
+	}
+
+	const STYLE_ORDER = ["tech", "cute", "mech"];
+
+	const name = "voice-pet";
+	const inject = []; // no client-side service dependencies
+
+	function apply(ctx) {
+		const prefs = loadPrefs();
+		if (!prefs.style) prefs.style = "tech";
+		if (prefs.volume === undefined) prefs.volume = 0.9;
+		if (prefs.enabled === undefined) prefs.enabled = true;
+		try {
+			cursor = Number.parseInt(localStorage.getItem(PLUGIN_ID + ":cursor") || "0", 10) || 0;
+		} catch {}
+
+		const voice = createVoiceEngine(prefs);
+		const pet = createPetUI(() => prefs, () => {
+			const i = STYLE_ORDER.indexOf(prefs.style);
+			prefs.style = STYLE_ORDER[(i + 1) % STYLE_ORDER.length];
+			savePrefs(prefs);
+			pet.showBubble(`风格：${prefs.style}`);
+		});
+
+		let speaking = false;
+		const react = async (scenario) => {
+			if (!prefs.enabled || disposed) return;
+			if (Date.now() - lastSpeakTime < DEBOUNCE_MS) return;
+			if (scenario === "task_done" && isDoNotDisturb()) return;
+			lastSpeakTime = Date.now();
+			pet.setState("speaking");
+			pet.showBubble(scenario === "error" ? "检测到异常" : scenario === "session_end" ? "会话已结束" : "任务已完成");
+			speaking = true;
+			try {
+				await voice.speakScenario(scenario, prefs.volume);
+			} catch {} // autoplay/audio errors are never fatal
+			speaking = false;
+			pet.setState("idle");
+		};
+
+		const poll = async () => {
+			if (disposed || speaking) return;
+			try {
+				const res = await fetch(`/api/voice-pet/events?after=${cursor}`, { signal: AbortSignal.timeout(4000) });
+				if (!res.ok) return;
+				const data = await res.json();
+				if (Array.isArray(data.events) && data.events.length > 0) {
+					cursor = data.events[data.events.length - 1].id;
+					try {
+						localStorage.setItem(PLUGIN_ID + ":cursor", String(cursor));
+					} catch {}
+					// one voice at a time: only the newest scenario
+					await react(data.events[data.events.length - 1].scenario);
+				}
+			} catch {} // host not ready or transient error: keep polling silently
+		};
+
+		(async () => {
+			console.log("[VoicePet] 客户端启动");
+			await voice.init().catch(() => {});
+			// unlock Web Speech voices on the first user interaction
+			document.addEventListener(
+				"click",
+				() => {
+					if ("speechSynthesis" in window) speechSynthesis.getVoices();
+				},
+				{ once: true }
+			);
+			// startup greeting once per page load
+			setTimeout(() => {
+				voice
+					.speakStartup(prefs.volume)
+					.catch((err) => console.log("[VoicePet] 启动问候未能播放:", err?.message ?? err));
+			}, 1500);
+			setInterval(poll, POLL_MS);
+			poll();
+		})();
+
+		ctx.effect(() => () => {
+			disposed = true;
+			voice.stop();
+			pet.el.remove();
+		}, "voice-pet: client cleanup");
+	}
+
+	exports.name = name;
+	exports.inject = inject;
+	exports.apply = apply;
+	return module.exports;
+}});

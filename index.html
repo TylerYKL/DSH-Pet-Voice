@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>Voice Pet 插件 Demo（Edge TTS 版 + 启动问候）</title>
+<style>
+  body{margin:0;font-family:"Segoe UI","PingFang SC",sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:24px;}
+  h1{margin:0 0 8px;font-size:26px;}
+  .sub{color:#94a3b8;margin-bottom:20px;}
+  .panel{background:#1e293b;border:1px solid #334155;border-radius:16px;padding:20px;width:min(680px,100%);box-shadow:0 10px 40px rgba(0,0,0,.4);}
+  .row{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0;align-items:center;}
+  button{background:#38bdf8;color:#0f172a;border:none;border-radius:10px;padding:9px 14px;font-weight:600;cursor:pointer;}
+  button.secondary{background:#334155;color:#e2e8f0;}
+  button.style-btn{background:#334155;color:#e2e8f0;border:2px solid transparent;}
+  button.style-btn.active{border-color:#38bdf8;background:#1e3a5f;}
+  label{color:#94a3b8;display:flex;align-items:center;gap:8px;}
+  input[type=range]{width:140px;}
+  .log{margin-top:14px;background:#0b1220;border-radius:10px;padding:12px;height:200px;overflow:auto;font-family:monospace;font-size:12px;color:#a5f3fc;}
+  .log div{margin:2px 0;}
+  .status{display:inline-block;padding:2px 8px;border-radius:6px;font-size:12px;background:#334155;}
+  .status.speaking{background:#22c55e;color:#052e16;}
+</style></head><body>
+<h1>🐾 Voice Pet 插件 Demo（Edge TTS 版 + 启动问候）</h1>
+<p class="sub">使用 Edge TTS + ffmpeg 后处理生成的音频文件，支持启动问候与多条科技风格语音</p>
+<div class="panel">
+  <div class="row">
+    <button id="btnStartup">模拟 DSH 启动问候</button>
+    <button id="btnTask">模拟任务完成</button>
+    <button id="btnError" class="secondary">模拟出错</button>
+    <button id="btnIdle" class="secondary">空闲提醒</button>
+    <button id="btnSessionEnd" class="secondary">会话结束</button>
+    <button id="btnRestart" class="secondary">🔄 重启 DSH</button>
+    <button id="btnMute" class="secondary">🔊 静音</button>
+  </div>
+  <div class="row">
+    <span style="color:#94a3b8;">风格：</span>
+    <button class="style-btn active" data-style="tech">⚡ 科技</button>
+    <button class="style-btn" data-style="cute">🎀 可爱</button>
+    <button class="style-btn" data-style="mech">🤖 机械</button>
+  </div>
+  <div class="row">
+    <label>音量 <input type="range" id="vol" min="0" max="1" step="0.05" value="0.9"/></label>
+    <span class="status" id="status">idle</span>
+  </div>
+  <div class="log" id="log"></div>
+</div>
+<script>
+const logEl=document.getElementById('log');
+function log(m){const d=document.createElement('div');d.textContent=`[${new Date().toLocaleTimeString()}] ${m}`;logEl.appendChild(d);logEl.scrollTop=logEl.scrollHeight;}
+
+const FILE_MAP = {
+  cute:  { complete: "assets/voices/cute_complete.mp3", error: "assets/voices/cute_error.mp3", idle: "assets/voices/cute_idle.mp3" },
+  mech:  { complete: "assets/voices/mech_complete.mp3", error: "assets/voices/mech_error.mp3", idle: "assets/voices/mech_idle.mp3" },
+  tech:  {
+    complete:   "assets/voices/tech_task_done.mp3",
+    complete_2: "assets/voices/tech_task_done_2.mp3",
+    error:      "assets/voices/tech_error.mp3",
+    error_2:    "assets/voices/tech_error_2.mp3",
+    idle:       "assets/voices/tech_idle.mp3",
+    idle_2:     "assets/voices/tech_idle_2.mp3",
+    startup:    "assets/voices/tech_startup.mp3",
+    startup_2:  "assets/voices/tech_startup_2.mp3",
+    session_end:"assets/voices/tech_session_end.mp3",
+    session_end_2:"assets/voices/tech_session_end_2.mp3",
+  },
+};
+
+const TEXT_MAP = {
+  startup: "早安，欢迎回来。系统已就绪。",
+  startup_2: "系统启动完成。主人，今日有何吩咐？",
+  complete: "任务已完成。请确认结果。",
+  complete_2: "执行结束。所有指令已处理完毕。",
+  error: "检测到异常。请立即检查日志。",
+  error_2: "警告。操作未成功，请重试。",
+  idle: "系统空闲中。等待您的输入。",
+  idle_2: "待机状态。随时待命。",
+  session_end: "会话已结束。感谢使用。",
+  session_end_2: "连接断开。随时欢迎您回来。",
+};
+
+let currentStyle="tech", muted=false, audio=null;
+
+const pet=document.createElement('div');
+pet.style.cssText='position:fixed;right:24px;bottom:24px;width:80px;height:80px;cursor:grab;z-index:9999;user-select:none;';
+pet.innerHTML=`<div class="pb" style="width:80px;height:80px;border-radius:50%;background:radial-gradient(circle at 35% 30%,#fbbf24,#f59e0b 60%,#b45309);box-shadow:0 6px 20px rgba(0,0,0,.5);animation:breathe 3s ease-in-out infinite;position:relative;">
+  <div style="position:absolute;top:22px;left:14px;width:52px;height:32px;">
+    <div class="eye" style="position:absolute;top:4px;left:6px;width:10px;height:12px;background:#1e293b;border-radius:50%;animation:blink 4s infinite;"></div>
+    <div class="eye" style="position:absolute;top:4px;right:6px;width:10px;height:12px;background:#1e293b;border-radius:50%;animation:blink 4s infinite;"></div>
+    <div class="mouth" style="position:absolute;bottom:4px;left:50%;transform:translateX(-50%);width:16px;height:5px;background:#1e293b;border-radius:0 0 8px 8px;transition:all .15s;"></div>
+  </div></div>
+  <div class="bubble" style="position:absolute;bottom:90px;right:0;background:#fff;color:#0f172a;padding:6px 10px;border-radius:10px;font-size:12px;max-width:160px;box-shadow:0 4px 12px rgba(0,0,0,.3);opacity:0;transform:translateY(6px);transition:opacity .2s,transform .2s;pointer-events:none;"></div>`;
+document.body.appendChild(pet);
+if(!document.getElementById('vp-kf')){const s=document.createElement('style');s.id='vp-kf';s.textContent='@keyframes breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.04)}}@keyframes blink{0%,92%,100%{transform:scaleY(1)}95%{transform:scaleY(.1)}}@keyframes talk{from{height:5px;width:16px}to{height:12px;width:10px;border-radius:50%}}@keyframes shake{0%,100%{transform:rotate(-2deg)}50%{transform:rotate(2deg)}}';document.head.appendChild(s);}
+function setState(s){const b=pet.querySelector('.pb'),m=pet.querySelector('.mouth');if(s==='speaking'){b.style.animation='shake .2s infinite';m.style.animation='talk .25s infinite alternate';}else{b.style.animation='breathe 3s ease-in-out infinite';m.style.animation='';}document.getElementById('status').textContent=s;document.getElementById('status').classList.toggle('speaking',s==='speaking');}
+function showBubble(t){const b=pet.querySelector('.bubble');b.textContent=t;b.style.opacity='1';b.style.transform='translateY(0)';clearTimeout(pet._bt);pet._bt=setTimeout(()=>{b.style.opacity='0';b.style.transform='translateY(6px)';},3000);}
+function stop(){if(audio){audio.pause();audio.src="";audio=null;}setState('idle');}
+function pickVariant(scenario){
+  const v=[scenario, scenario+"_2"];
+  return v.find(x=>FILE_MAP[currentStyle]?.[x])||scenario;
+}
+async function speak(text, style, scenario){
+  if(muted){log('已静音: '+text);showBubble(text);return;}
+  stop();
+  const chosen=scenario?pickVariant(scenario):null;
+  const file=chosen?FILE_MAP[style]?.[chosen]:null;
+  if(file){
+    try{
+      audio=new Audio(file);
+      audio.volume=parseFloat(document.getElementById('vol').value);
+      setState('speaking');showBubble(text);log(`[${style}] ${text}`);
+      audio.onended=()=>{audio=null;setState('idle');};
+      audio.onerror=()=>{audio=null;setState('idle');log('音频加载失败');};
+      await audio.play();
+      return;
+    }catch(e){log('音频播放失败: '+e.message);}
+  }
+  if(!('speechSynthesis' in window)){log('不支持语音合成');showBubble(text);setState('idle');return;}
+  const presets={cute:{rate:1.25,pitch:1.5},mech:{rate:0.9,pitch:0.8},tech:{rate:1.05,pitch:1.05}};
+  const p=presets[style];
+  const u=new SpeechSynthesisUtterance(text);
+  u.lang='zh-CN';u.rate=p.rate;u.pitch=p.pitch;u.volume=parseFloat(document.getElementById('vol').value);
+  const vs=speechSynthesis.getVoices();const zh=vs.find(v=>v.lang.startsWith('zh'))||vs.find(v=>v.lang.includes('CN'));if(zh)u.voice=zh;
+  setState('speaking');showBubble(text);log(`[${style}|fallback] ${text}`);
+  u.onend=()=>setState('idle');u.onerror=()=>setState('idle');speechSynthesis.cancel();speechSynthesis.speak(u);
+}
+let dragging=false,ox=0,oy=0;pet.addEventListener('mousedown',e=>{dragging=true;const r=pet.getBoundingClientRect();ox=e.clientX-r.left;oy=e.clientY-r.top;pet.style.right='auto';pet.style.bottom='auto';});window.addEventListener('mousemove',e=>{if(!dragging)return;pet.style.left=(e.clientX-ox)+'px';pet.style.top=(e.clientY-oy)+'px';});window.addEventListener('mouseup',()=>{dragging=false;});
+document.getElementById('btnStartup').onclick=()=>{
+  const s=Math.random()<0.5?'startup':'startup_2';
+  speak(TEXT_MAP[s], currentStyle, s);
+};
+document.getElementById('btnTask').onclick=()=>{
+  const s=Math.random()<0.5?'complete':'complete_2';
+  speak(TEXT_MAP[s], currentStyle, s);
+};
+document.getElementById('btnError').onclick=()=>{
+  const s=Math.random()<0.5?'error':'error_2';
+  speak(TEXT_MAP[s], currentStyle, s);
+};
+document.getElementById('btnIdle').onclick=()=>{
+  const s=Math.random()<0.5?'idle':'idle_2';
+  speak(TEXT_MAP[s], currentStyle, s);
+};
+document.getElementById('btnSessionEnd').onclick=()=>{
+  const s=Math.random()<0.5?'session_end':'session_end_2';
+  speak(TEXT_MAP[s], currentStyle, s);
+};
+document.getElementById('btnRestart').onclick=()=>{
+  if(!confirm('确定要重启 DSH 吗？重启会中断正在进行的任务，请谨慎操作。')) return;
+  log('用户确认重启，正在重新加载页面（Demo 环境无法直接重启 Electron 主进程）。');
+  location.reload();
+};
+document.getElementById('btnMute').onclick=e=>{muted=!muted;e.target.textContent=muted?'🔇 已静音':'🔊 静音';log(muted?'已静音':'取消静音');};
+document.querySelectorAll('.style-btn').forEach(b=>{b.onclick=()=>{document.querySelectorAll('.style-btn').forEach(x=>x.classList.remove('active'));b.classList.add('active');currentStyle=b.dataset.style;log('切换风格: '+currentStyle);};});
+log('Demo 已加载。点击"模拟 DSH 启动问候"体验启动语音。');
+</script></body></html>
