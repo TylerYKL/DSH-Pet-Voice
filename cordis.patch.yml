@@ -1,0 +1,5 @@
+# dsh-plugin-voice-pet bundle patch: inserts its plugin row into the web plugin roster,
+# mirroring the official dsh-pet shape (one row mounts both host and client halves).
+- insert:
+    - id: voice-pet
+      name: dsh-plugin-voice-pet
